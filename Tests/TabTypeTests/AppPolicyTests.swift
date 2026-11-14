@@ -5,9 +5,9 @@ import XCTest
 final class AppPolicyTests: XCTestCase {
 
     // Async so it runs on the main actor with every Swift 6 toolchain (the
-    // synchronous override is nonisolated before 6.2).
+    // synchronous override is nonisolated before 6.2). XCTestCase's own setUp
+    // does nothing, and calling it from here would send `self` off the actor.
     override func setUp() async throws {
-        try await super.setUp()
         AppPolicyStore.userOverrides = [:]
     }
 
