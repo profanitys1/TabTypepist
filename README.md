@@ -7,7 +7,7 @@
 **TabType predicts your next words as you type — in almost any app — and runs entirely on your Mac. No cloud. No account. No subscription. No telemetry.** It's an open-source [Cotypist](https://cotypist.app/) alternative that learns your voice and never sends a keystroke off your machine.
 
 ![License: MIT](https://img.shields.io/badge/License-MIT-green.svg)
-![Platform: macOS 14+](https://img.shields.io/badge/Platform-macOS%2014%2B-black?logo=apple)
+![Platform: macOS 26+](https://img.shields.io/badge/Platform-macOS%2026%2B-black?logo=apple)
 ![Apple Silicon](https://img.shields.io/badge/Apple%20Silicon-M1%E2%80%93M4-blue)
 ![Status: Alpha](https://img.shields.io/badge/Status-Alpha-orange)
 ![Built with llama.cpp](https://img.shields.io/badge/Built%20with-llama.cpp-red)
@@ -196,7 +196,7 @@ There are a few other open-source macOS autocomplete projects — each great in 
 5. Grant **Accessibility** when prompted (required — it's how TabType reads the text field and inserts completions). **Screen Recording** is strongly recommended: it's how TabType reads the conversation or document you're writing in, and measures fonts apps don't report.
 6. **First launch downloads the model** (~1.1–2.5 GB from Hugging Face, depending on your Mac's RAM tier). The menu-bar icon shows progress; suggestions start once it's ready.
 
-**Requirements:** Apple Silicon Mac (M1 or later), macOS 14+.
+**Requirements:** Apple Silicon Mac (M1 or later), macOS 26+.
 
 ## 🔒 Privacy
 
