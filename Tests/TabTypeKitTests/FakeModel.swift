@@ -14,6 +14,8 @@ final class FakeModel: TokenModel {
     private let defaultLogits: [String: Float]
     private(set) var sequenceText: [Int: String] = [:]
     private var buffers: [UnsafeMutableBufferPointer<Float>] = []
+    /// `decode` calls made (model passes after the prompt).
+    private(set) var decodeCalls = 0
 
     /// Sequences other than 0 still holding state.
     var liveCandidateSequences: [Int] { sequenceText.keys.filter { $0 > 0 }.sorted() }
@@ -54,6 +56,7 @@ final class FakeModel: TokenModel {
 
     func decode(_ entries: [BatchEntry]) throws -> [Logits] {
         releaseBuffers()
+        decodeCalls += 1
         return entries.map { entry in
             let piece = String(decoding: vocab.pieces[Int(entry.token)], as: UTF8.self)
             sequenceText[entry.sequence, default: ""] += piece

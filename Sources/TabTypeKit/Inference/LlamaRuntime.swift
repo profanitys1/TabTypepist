@@ -48,6 +48,17 @@ public final class LlamaRuntime: TokenModel, @unchecked Sendable {
     public private(set) var cachedTokens: [TokenID] = []
     /// Prompt tokens actually computed by the last `evaluatePrompt` (for telemetry).
     public private(set) var lastPrefillCount = 0
+    /// `llama_decode` calls made so far (each is one pass over the model — the
+    /// unit latency is counted in).
+    public private(set) var decodeCalls = 0
+    /// Answer a prompt identical to the cached one from its saved logits instead
+    /// of decoding its last token again. Typing inside a word leaves the prompt
+    /// unchanged (the partial word is healed, not prompted), so this saves one
+    /// model pass on most keystrokes. Off only for measurements.
+    public var reusesPromptLogits = true
+    /// Logits after the last token of `cachedTokens`, when `promptLogitsValid`.
+    private let promptLogits: UnsafeMutableBufferPointer<Float>
+    private var promptLogitsValid = false
 
     private let model: OpaquePointer
     private let context: OpaquePointer
@@ -103,10 +114,12 @@ public final class LlamaRuntime: TokenModel, @unchecked Sendable {
         self.supportsSplice = llama_memory_can_shift(llama_get_memory(context))
             && llama_model_n_swa(model) == 0
         self.vocab = Self.buildVocab(vocabPointer)
+        self.promptLogits = .allocate(capacity: Int(llama_vocab_n_tokens(vocabPointer)))
     }
 
     deinit {
         if let adapter { llama_adapter_lora_free(adapter) }
+        promptLogits.deallocate()
         llama_batch_free(batch)
         llama_free(context)
         llama_model_free(model)
@@ -214,6 +227,11 @@ public final class LlamaRuntime: TokenModel, @unchecked Sendable {
         // Candidate sequences never outlive a request, but make sure.
         for seq in 1..<maxSequences { drop(sequence: seq) }
 
+        if reusesPromptLogits, promptLogitsValid, tokens == cachedTokens {
+            lastPrefillCount = 0
+            return Logits(UnsafeBufferPointer(promptLogits))
+        }
+        promptLogitsValid = false
         var common = commonPrefix(cachedTokens, tokens)
         if common < cachedTokens.count, allowSplice, supportsSplice {
             common = splice(from: common, toMatch: tokens)
@@ -228,7 +246,12 @@ public final class LlamaRuntime: TokenModel, @unchecked Sendable {
         let suffix = Array(tokens[common...])
         lastPrefillCount = suffix.count
         try decodePrompt(suffix, startPosition: common)
-        return Logits(UnsafeBufferPointer(start: llama_get_logits_ith(context, -1), count: vocab.count))
+        // Kept in our own buffer: valid until the prompt changes, not just until
+        // the next decode.
+        guard let fresh = llama_get_logits_ith(context, -1) else { throw LlamaError.decode(-1) }
+        promptLogits.baseAddress!.update(from: fresh, count: promptLogits.count)
+        promptLogitsValid = true
+        return Logits(UnsafeBufferPointer(promptLogits))
     }
 
     public func fork(to sequence: Int) {
@@ -254,6 +277,7 @@ public final class LlamaRuntime: TokenModel, @unchecked Sendable {
             batch.seq_id[i]![0] = Int32(entry.sequence)
             batch.logits[i] = 1
         }
+        decodeCalls += 1
         let status = llama_decode(context, batch)
         guard status == 0 else { throw LlamaError.decode(status) }
         return (0..<entries.count).map {
@@ -270,6 +294,7 @@ public final class LlamaRuntime: TokenModel, @unchecked Sendable {
     public func reset() {
         llama_memory_clear(memory, true)
         cachedTokens.removeAll()
+        promptLogitsValid = false
     }
 
     // MARK: Internals
@@ -317,6 +342,7 @@ public final class LlamaRuntime: TokenModel, @unchecked Sendable {
                 batch.seq_id[i]![0] = 0
                 batch.logits[i] = global == tokens.count - 1 ? 1 : 0
             }
+            decodeCalls += 1
             let status = llama_decode(context, batch)
             guard status == 0 else {
                 reset()

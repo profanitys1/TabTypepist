@@ -38,6 +38,15 @@ public struct DecoderOptions: Sendable, Equatable {
     /// preferred by `hintBonus` (log-space) when choosing the winner.
     public var hint: [UInt8] = []
     public var hintBonus = log(3.0)
+    /// The caller's show bar: below it the suggestion is never displayed, so the
+    /// phrase search (most of a request's model passes) is skipped and only the
+    /// first word and its alternatives are returned. 0 always searches. Applies
+    /// with `beamFromBestFirstWord`, where the first word is final before the
+    /// search starts.
+    public var minimumConfidenceToExtend = 0.0
+    /// Factor on that bar when the first word follows `hint` (callers show the
+    /// author's repeated phrases at a lower confidence).
+    public var hintFollowerConfidenceScale = 1.0
 
     public init() {}
 }
@@ -164,8 +173,13 @@ public enum CompletionDecoder {
     /// - Parameter text: everything before the caret, as it should be continued
     ///   (context included). The typed text must be at its very end.
     /// - Parameter isCancelled: polled between decode steps; a true result aborts.
+    /// - Parameter onFirstWord: called once, before the phrase search, with the
+    ///   first word as a complete one-word result — the final result's text
+    ///   starts with it, so it can be shown while the rest is searched. Not
+    ///   called when there is no search to wait for.
     public static func complete(_ text: String, model: TokenModel, options: DecoderOptions = DecoderOptions(),
-                                isCancelled: @escaping () -> Bool = { false }) throws -> CompletionResult? {
+                                isCancelled: @escaping () -> Bool = { false },
+                                onFirstWord: ((CompletionResult) -> Void)? = nil) throws -> CompletionResult? {
         var split = HealSplit.split(text)
         var promptTokens = model.tokenize(split.prompt, addSpecial: true)
         // Heal bytes no single token can start (exotic scripts/byte runs): fall back
@@ -178,6 +192,7 @@ public enum CompletionDecoder {
 
         var session = Session(model: model, options: options, heal: split.heal,
                               promptLength: promptTokens.count, isCancelled: isCancelled)
+        session.onFirstWord = onFirstWord
         defer { session.dropSequences() }
         let logits = try model.evaluatePrompt(promptTokens)
         return try session.run(promptLogits: logits)
@@ -235,6 +250,7 @@ private struct Session {
     var usedSequences: [Int] = []
     var scratch: [Float] = []
     var generated = 0
+    var onFirstWord: ((CompletionResult) -> Void)?
 
     init(model: TokenModel, options: DecoderOptions, heal: [UInt8], promptLength: Int,
          isCancelled: @escaping () -> Bool) {
@@ -356,7 +372,22 @@ private struct Session {
         var root = 0
         var words = [WordScore(text: best.text, probability: exp(best.logP))]
         var trailingSpace = candidates[best.index].stopToken.map { vocab.pieces[Int($0)].first == 0x20 } ?? false
-        if options.maxWords > 1, options.extensionThreshold <= 1,
+        let wantsPhrase = options.maxWords > 1 && options.extensionThreshold <= 1
+        // A first word the caller won't show needs no phrase after it.
+        let showBar = options.minimumConfidenceToExtend * (best.followsHint ? options.hintFollowerConfidenceScale : 1)
+        let worthExtending = !options.beamFromBestFirstWord || exp(best.logP) >= showBar
+        if wantsPhrase, worthExtending, options.beamFromBestFirstWord, let onFirstWord {
+            let first = candidates[best.index]
+            if first.stopToken != nil, !first.nextChoices.isEmpty {
+                onFirstWord(CompletionResult(
+                    text: best.text, confidence: exp(best.logP), words: words,
+                    alternatives: merged.dropFirst().prefix(options.maxAlternatives)
+                        .map { WordScore(text: $0.text, probability: exp($0.logP)) },
+                    predictedTrailingSpace: trailingSpace, promptTokens: promptLength,
+                    generatedTokens: generated, followsHint: best.followsHint))
+            }
+        }
+        if wantsPhrase, worthExtending,
            let phrase = try beam(from: candidates, merged: merged) {
             root = phrase.root
             let first = merged[root]
@@ -488,14 +519,14 @@ private struct Session {
             }
             let logits = try model.decode(entries)
             generated += entries.count
+            let analyses = LogitMath.analyze(logits, k: options.beamBranching, blocked: vocab.blocked)
             for i in next.indices {
                 let l = logits[i]
-                let norm = LogitMath.logSumExp(l, blocked: nil, scratch: &scratch)
+                let norm = analyses[i].logNormalizer
                 // The model wants to stop: the phrase ends with this word.
-                var best: Float = 0
-                var bestIndex: vDSP_Length = 0
-                vDSP_maxvi(l.values.baseAddress!, 1, &best, &bestIndex, vDSP_Length(l.values.count))
-                if vocab.blocked[Int(bestIndex)] {
+                let best = analyses[i].maxValue
+                let bestIndex = analyses[i].argmax
+                if vocab.blocked[bestIndex] {
                     var finished = next[i]
                     finished.logProbability += Double(best - norm)
                     commitWord(&finished)
@@ -503,7 +534,7 @@ private struct Session {
                     next[i].proposals = []
                     continue
                 }
-                var choices = LogitMath.topK(l, k: options.beamBranching, candidates: nil, blocked: vocab.blocked)
+                var choices = analyses[i].top
                     .map { Choice(token: $0, logProbability: Double(l.values[Int($0)] - norm)) }
                 if !next[i].forced.isEmpty, let f = forcedChoice(next[i].forced, l),
                    !choices.contains(where: { $0.token == f.token }) {

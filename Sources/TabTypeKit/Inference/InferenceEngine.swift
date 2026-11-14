@@ -121,14 +121,21 @@ public actor InferenceEngine {
 
     /// Runs the decoder for `text` unless a newer request superseded this one.
     /// Returns nil when superseded, cancelled mid-decode, or not loaded.
-    public func complete(_ text: String, options: DecoderOptions, requestID: UInt64) throws -> CompletionResult? {
+    /// - Parameter onFirstWord: called on the inference queue as soon as the first
+    ///   word is settled, while the rest of the phrase is still being searched
+    ///   (see `CompletionDecoder.complete`); never for a superseded request.
+    public func complete(_ text: String, options: DecoderOptions, requestID: UInt64,
+                         onFirstWord: (@Sendable (CompletionResult) -> Void)? = nil) throws -> CompletionResult? {
         guard gate.isCurrent(requestID), let runtime = activeRuntime() else { return nil }
         lastUse = Date()
         let gate = self.gate
         do {
-            return try CompletionDecoder.complete(text, model: runtime, options: options) {
-                !gate.isCurrent(requestID)
-            }
+            return try CompletionDecoder.complete(
+                text, model: runtime, options: options,
+                isCancelled: { !gate.isCurrent(requestID) },
+                onFirstWord: onFirstWord.map { notify in
+                    { partial in if gate.isCurrent(requestID) { notify(partial) } }
+                })
         } catch is CancellationError {
             return nil
         }

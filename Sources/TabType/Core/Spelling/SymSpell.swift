@@ -8,6 +8,10 @@ final class SymSpell {
 
     private var words: [String: Int] = [:]                 // word -> frequency
     private var deletes: [String: [String]] = [:]          // delete-variant -> words
+    /// Every word, ordered by UTF-8 bytes: the words starting with a prefix are
+    /// one contiguous run, found by binary search instead of a scan of the whole
+    /// dictionary (the typo gate asks before every mid-word suggestion).
+    private var sortedWords: [String] = []
     private(set) var isReady = false
 
     init(maxEditDistance: Int = 2, prefixLength: Int = 7) {
@@ -30,30 +34,46 @@ final class SymSpell {
                 deletes[d, default: []].append(word)
             }
         }
+        sortedWords = words.keys.sorted { $0.utf8.lexicographicallyPrecedes($1.utf8) }
         isReady = true
+    }
+
+    /// The run of `sortedWords` whose UTF-8 bytes start with `prefix`'s.
+    private func wordsWithBytePrefix(_ prefix: String) -> ArraySlice<String> {
+        let p = prefix.utf8
+        var low = 0, high = sortedWords.count
+        while low < high {
+            let mid = (low + high) / 2
+            if sortedWords[mid].utf8.lexicographicallyPrecedes(p) { low = mid + 1 } else { high = mid }
+        }
+        var end = low
+        while end < sortedWords.count, sortedWords[end].utf8.starts(with: p) { end += 1 }
+        return sortedWords[low..<end]
     }
 
     /// Whether `candidate` (lowercased) is a known dictionary word or a prefix of one —
     /// used as a lightweight mid-word plausibility check (is `partial+fragment` on a
-    /// path to a real word?). Linear scan; only called once per suggestion, not per
-    /// keystroke, so the cost is negligible.
+    /// path to a real word?).
     func isKnownOrPrefix(_ candidate: String) -> Bool {
         guard isReady, !candidate.isEmpty else { return true }   // fail open
         let c = candidate.lowercased()
         if words[c] != nil { return true }
-        return words.keys.contains { $0.hasPrefix(c) }
+        // `hasPrefix` compares whole characters; the byte run only narrows where
+        // to look (a base letter is a byte prefix of the same letter with a
+        // combining mark, but not a character prefix).
+        return wordsWithBytePrefix(c).contains { $0.hasPrefix(c) }
     }
 
     /// Highest-frequency dictionary word that STARTS WITH `prefix` (lowercased) —
     /// instant word completion with no model involved. Returns nil when the best
     /// hit is the prefix itself (word already complete), the prefix is unknown, or
-    /// the hit is too rare to be a confident guess. Linear scan: called once per
-    /// keystroke, same cost class as `isKnownOrPrefix`.
+    /// the hit is too rare to be a confident guess.
     func topCompletion(prefix: String) -> String? {
         guard isReady, prefix.count >= 3 else { return nil }
         let p = prefix.lowercased()
         var best: (word: String, freq: Int)?
-        for (word, freq) in words where word.count > p.count && word.hasPrefix(p) {
+        for word in wordsWithBytePrefix(p) where word.count > p.count && word.hasPrefix(p) {
+            let freq = words[word] ?? 0
             if best == nil || freq > best!.freq { best = (word, freq) }
         }
         guard let best, best.freq >= 1000 else { return nil }

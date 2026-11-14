@@ -51,30 +51,15 @@ final class SpellChecker: @unchecked Sendable {
         }
     }
 
-    /// Whether `partial + fragment` is a known word or a prefix of one, for the given
-    /// language. Falls open (true) if no dictionary is loaded/ready. Used as a
-    /// mid-word sanity check on model suggestions — cheap, since it runs once per
-    /// suggestion (not per keystroke).
-    ///
-    /// Also checks English as a second pass when the configured language rejects a
-    /// fragment: `autocorrectLanguage` defaults from the system locale, which often
-    /// doesn't match the language actually being typed (e.g. a non-English system
-    /// locale with the user typing English) — without this, the guard would reject
-    /// nearly everything typed in a different language than the configured one.
-    func isPlausibleContinuation(partial: String, fragment: String, language: String) async -> Bool {
-        let lang = normalized(language)
-        if await checkPlausible(partial: partial, fragment: fragment, lang: lang) { return true }
-        guard lang != "en" else { return false }
-        return await checkPlausible(partial: partial, fragment: fragment, lang: "en")
-    }
-
     /// Whether the token before the caret looks like a typo, used to skip suggesting
     /// entirely (a completion of a misspelling is never what the user wants).
     /// `isPartial` = the caret is mid-word: a typo means the partial can never become
     /// a word. Otherwise the word is complete: a typo means it's not in the dictionary
     /// but a near-neighbor is. Fails open (false) when no dictionary is ready, the
-    /// token is too short, or contains non-letters (names, code, numbers). Like
-    /// `isPlausibleContinuation`, also accepts English as a second-pass language.
+    /// token is too short, or contains non-letters (names, code, numbers). English
+    /// is checked as a second pass when the configured language rejects the word:
+    /// `autocorrectLanguage` defaults from the system locale, which often isn't
+    /// the language being typed.
     func isLikelyTypo(word: String, isPartial: Bool, language: String) async -> Bool {
         guard word.count >= 3, word.allSatisfy({ $0.isLetter }) else { return false }
         let lang = normalized(language)
@@ -119,18 +104,6 @@ final class SpellChecker: @unchecked Sendable {
                 } else {
                     cont.resume(returning: sym.bestSuggestion(word) != nil)
                 }
-            }
-        }
-    }
-
-    private func checkPlausible(partial: String, fragment: String, lang: String) async -> Bool {
-        await withCheckedContinuation { cont in
-            queue.async { [weak self] in
-                guard let self, let sym = self.ensureLoaded(lang), sym.isReady else {
-                    cont.resume(returning: true)   // fail open — no dictionary, don't block
-                    return
-                }
-                cont.resume(returning: sym.isKnownOrPrefix(partial + fragment))
             }
         }
     }

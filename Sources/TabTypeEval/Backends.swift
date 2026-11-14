@@ -85,6 +85,8 @@ final class DecoderBackend: CompletionBackend {
     private let hintFactor: Double
     private let noisy: Bool
     private let conversations: Bool
+    /// Like the app: a first word below the show threshold gets no phrase search.
+    private let gatesExtension: Bool
     private var indexes: [Int: SuffixIndex] = [:]
     private(set) var hintsOffered = 0
     private(set) var hintsUsed = 0
@@ -93,7 +95,8 @@ final class DecoderBackend: CompletionBackend {
     init(runtime: LlamaRuntime, options: DecoderOptions, threshold: Double,
          template: ModelTemplate?, templateName: String, authorName: String?, situationHeader: Bool = false,
          noisy: Bool = false, sections: Bool = false, conversations: Bool = true,
-         history: [CorpusEntry]? = nil, hintFactor: Double = 0.5) {
+         history: [CorpusEntry]? = nil, hintFactor: Double = 0.5, gatesExtension: Bool = true) {
+        self.gatesExtension = gatesExtension
         self.noisy = noisy
         self.conversations = conversations
         self.history = history
@@ -124,6 +127,10 @@ final class DecoderBackend: CompletionBackend {
                 support = hint.support
                 hintsOffered += 1
             }
+        }
+        if gatesExtension {
+            options.minimumConfidenceToExtend = threshold
+            options.hintFollowerConfidenceScale = support >= 2 ? hintFactor : 1
         }
         let result = try CompletionDecoder.complete(text, model: runtime, options: options)
         if result?.followsHint == true { hintsUsed += 1 }

@@ -113,7 +113,19 @@ final class Engine {
     /// waiting on it: a keystroke that only EXTENDS its input lets it finish and
     /// splices its result instead of cancelling ~90ms of work (Cotypist's
     /// in-flight decode deferral).
-    private var inFlight: (input: String, id: Int)?
+    /// `firstWord`: its suggestion's first word, once the model has settled it —
+    /// typing that contradicts it means the rest is wasted work.
+    private var inFlight: (input: String, id: Int, firstWord: String?)?
+    /// The ghost on screen is the first word of generation `id`, shown early; the
+    /// finished phrase replaces it in place. `painted`: it reached the screen.
+    /// `paintedAfter`: the keystroke it was painted after (nil: not yet).
+    private var earlyGhost: (id: Int, painted: Bool, paintedAfter: Date?)?
+
+    private func earlyGhostReachedScreen(_ suggestion: String) {
+        guard earlyGhost != nil, currentSuggestion == suggestion else { return }
+        earlyGhost?.painted = true
+        earlyGhost?.paintedAfter = lastKeystrokeAt
+    }
     private var inFlightCounter = 0
     private var deferredWhileInFlight = false
     /// One-shot flag so the disabled state is logged once, not per keystroke.
@@ -1261,7 +1273,9 @@ final class Engine {
         // keystroke cancels the generation in flight (the engine's request gate),
         // so mid-burst requests never queue up behind each other, and the
         // stale-result guard drops anything the field has moved past.
-        poll(0.02)
+        // With a local copy of the field nothing depends on the app having shown
+        // the key yet, so the first look happens on the next run-loop turn.
+        poll(expectedInput != nil ? 0 : 0.02)
     }
 
     /// If the token just before the boundary is a known emoticon (":-)"), replace it
@@ -1551,7 +1565,8 @@ final class Engine {
         // A generation for an earlier prefix of this text is still running: let it
         // finish (it's at most ~100ms away) and splice its result, rather than
         // cancel it and start over.
-        if let running = inFlight, ctx.input != running.input, ctx.input.hasPrefix(running.input) {
+        if let running = inFlight, ctx.input != running.input, ctx.input.hasPrefix(running.input),
+           Engine.typedAhead(ctx.input.dropFirst(running.input.count), agreesWith: running.firstWord) {
             deferredWhileInFlight = true
             lastPredictedPrompt = ""   // the follow-up run must not be deduped
             return
@@ -1595,11 +1610,23 @@ final class Engine {
             Statistics.shared.record(.requested)
             self.inFlightCounter += 1
             let id = self.inFlightCounter
-            self.inFlight = (ctx.input, id)
-            let raw = await engine.complete(req)
+            self.inFlight = (ctx.input, id, nil)
+            let input = ctx.input
+            // The first word is final before the phrase search starts: show it
+            // then, and let the finished phrase grow the ghost in place.
+            let early: ((String) -> Void)? = !self.settings.showFirstWordEarly ? nil : { [weak self] word in
+                guard let self, self.inFlight?.id == id else { return }
+                self.inFlight?.firstWord = word
+                Task {
+                    await self.handlePredictionResult(raw: word, req: req, ctxInput: input, policy: policy,
+                                                      startedAt: startedAt, earlyFor: id)
+                }
+            }
+            let raw = await engine.complete(req, onFirstWord: early)
             if self.inFlight?.id == id { self.inFlight = nil }
             await self.handlePredictionResult(
-                raw: raw, req: req, ctxInput: ctx.input, policy: policy, startedAt: startedAt)
+                raw: raw, req: req, ctxInput: ctx.input, policy: policy, startedAt: startedAt, finishing: id)
+            if self.earlyGhost?.id == id { self.earlyGhost = nil }
             // Typing that waited on this generation: if the splice didn't produce
             // a ghost, predict for what's in the field now.
             if self.deferredWhileInFlight, self.inFlight == nil {
@@ -1625,6 +1652,14 @@ final class Engine {
     nonisolated static func fieldIsLargeEnough(_ frame: CGRect) -> Bool {
         if frame.width < 4 || frame.height < 4 { return true }
         return frame.width * frame.height >= 6400 && (frame.height >= 32 || frame.width >= 300)
+    }
+
+    /// Whether a running generation is still worth waiting for after the user
+    /// typed `typed` past its input: unknown until its first word is settled;
+    /// after that, only while the typing follows that word (or has gone past it).
+    nonisolated static func typedAhead(_ typed: Substring, agreesWith firstWord: String?) -> Bool {
+        guard let firstWord else { return true }
+        return firstWord.hasPrefix(typed) || typed.hasPrefix(firstWord)
     }
 
     /// What's left of `suggestion` (made for `requested`) once the field holds
@@ -1656,8 +1691,15 @@ final class Engine {
     /// Post-processing for a finished suggestion (already exact insertion text):
     /// after-cursor duplicate trim, staleness/remainder/repeat checks via the
     /// session, then presentation.
+    ///
+    /// `earlyFor`: `raw` is only the first word of generation `earlyFor`, which is
+    /// still searching for the rest — show it, start nothing else. `finishing`:
+    /// the finished result of that generation, which may grow its early ghost.
     private func handlePredictionResult(raw: String?, req: CompletionRequest, ctxInput: String,
-                                        policy: AppPolicy, startedAt: DispatchTime) async {
+                                        policy: AppPolicy, startedAt: DispatchTime,
+                                        earlyFor: Int? = nil, finishing: Int? = nil) async {
+        // An early word that arrives after its generation ended is old news.
+        if let earlyFor, inFlight?.id != earlyFor { return }
         let elapsedMs = (DispatchTime.now().uptimeNanoseconds - startedAt.uptimeNanoseconds) / 1_000_000
         if settings.verboseLog {
             Log.shared.debug("predict raw model output (pre-post-processing): \(raw.map { "\"\($0)\"" } ?? "nil")")
@@ -1714,8 +1756,9 @@ final class Engine {
             // Re-kick for the CURRENT input — without this, a burst whose requests
             // were all stale ends with the model idle and no suggestion ever shown.
             // (Not while a remainder is being Tabbed through: the "changed" input
-            // is the accepted word itself.)
-            if rekick { schedulePrediction() }
+            // is the accepted word itself.) An early word leaves it to the
+            // finished result.
+            if rekick, earlyFor == nil { schedulePrediction() }
             return
         case .held:
             Statistics.shared.record(.heldForRemainder)
@@ -1727,10 +1770,30 @@ final class Engine {
             return
         }
 
-        Log.shared.debug("predict -> \"\(suggestion)\" (\(elapsedMs)ms)")
+        Log.shared.debug("predict -> \"\(suggestion)\"\(earlyFor != nil ? " [first word]" : "") (\(elapsedMs)ms)")
         // Wrapped (multi-line) ghost is only safe when nothing follows the caret —
         // otherwise the wrapped lines paint over the user's own text below.
         let allowWrap = req.afterCursor.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+        if let earlyFor {
+            earlyGhost = (earlyFor, false, nil)
+            presentWhenSettled(suggestion: suggestion, isNewSuggestion: true, allowWrap: allowWrap)
+            return
+        }
+        // The finished phrase of a generation whose first word is on screen (whole,
+        // or what's left after typing into it): grow that ghost where it stands —
+        // no settle wait, no second placement check.
+        if let early = earlyGhost, early.id == finishing, early.painted, overlay.isVisible,
+           let shown = currentSuggestion, suggestion.hasPrefix(shown) {
+            if suggestion != shown {
+                // Nothing typed since it was painted: the caret is where it was.
+                // Otherwise the usual settle applies to the new caret position.
+                presentWhenSettled(suggestion: suggestion, isNewSuggestion: false, allowWrap: allowWrap,
+                                   minSettle: early.paintedAfter == lastKeystrokeAt ? 0 : nil)
+            }
+            startLookahead(after: suggestion, input: requestedInput, request: req)
+            scheduleAlternativesAfterPause(for: suggestion)
+            return
+        }
         // Placement resolves inside the settle gate: presentation waits for a
         // typing pause and reads the caret THEN (mid-burst reads are stale).
         presentWhenSettled(suggestion: suggestion, isNewSuggestion: true, allowWrap: allowWrap)
@@ -1788,6 +1851,7 @@ final class Engine {
             } else {
                 overlay.showHUD(text: suggestion, windowRect: windowRect)
             }
+            earlyGhostReachedScreen(suggestion)
             return
         }
         if var caretRect = inlineCaret {
@@ -1859,6 +1923,7 @@ final class Engine {
                     self.overlay.showHUD(text: suggestion, windowRect: windowRect)
                 }
                 self.lastPaintedCaret = rect
+                self.earlyGhostReachedScreen(suggestion)
                 Log.shared.debug("ghost painted \(Int(Date().timeIntervalSince(self.lastKeystrokeAt) * 1000))ms after the last edit")
             }
             /// AX-styled baseline: the caret-box estimate plus this field's measured
@@ -2010,6 +2075,7 @@ final class Engine {
             }
         } else {
             overlay.showHUD(text: suggestion, windowRect: windowRect)
+            earlyGhostReachedScreen(suggestion)
         }
     }
 

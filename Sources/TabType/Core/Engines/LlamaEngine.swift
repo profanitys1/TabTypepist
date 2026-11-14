@@ -27,7 +27,20 @@ final class LlamaEngine {
 
     func cancelInFlight() { _ = models.inference.beginRequest() }
 
-    func complete(_ request: CompletionRequest) async -> String? {
+    /// Callbacks for first words of running requests, by request id (see
+    /// `complete(_:onFirstWord:)`).
+    private var firstWordHandlers: [UInt64: (String) -> Void] = [:]
+
+    /// The show bar for a result of `request`: see the measurements in `complete`.
+    private static func showBar(base: Double, midWord: Bool) -> Double {
+        base * (midWord ? 0.4 : 0.75)
+    }
+
+    /// - Parameter onFirstWord: the first word of the suggestion, as soon as the
+    ///   model has settled it and it clears the show bar — the returned text
+    ///   starts with it. Called at most once, before `complete` returns, and only
+    ///   when more words are still being searched for.
+    func complete(_ request: CompletionRequest, onFirstWord: ((String) -> Void)? = nil) async -> String? {
         guard let template = models.template, var options = models.decoderOptions else { return nil }
         let text = PromptAssembler(template: template, situationHeader: true).assemble(context(for: request))
 
@@ -46,7 +59,22 @@ final class LlamaEngine {
             options.hintBonus = AppSettings.shared.personalization.bonus
             hintSupport = hint.support
         }
-        let cacheKey = "\(models.loadedID ?? "")|\(options.maxWords)|\(options.showThreshold)|\(String(decoding: options.hint, as: UTF8.self))|\(text)"
+        // Measured on the author's own writing (867 cases from their real typing):
+        // finishing a half-typed word is right far more often than guessing the
+        // next one (53–65% vs 21–32% when shown), so mid-word gets the low bar
+        // (×0.4 → 0.08) and a word boundary the higher one (×0.75 → 0.15). Versus
+        // 0.10 / 0.15: same characters saved, fewer wrong ghosts on both their
+        // writing (42.0 → 37.4%) and seed-v1 (30.7 → 28.6%).
+        let midWord = request.beforeCursor.last.map { $0.isLetter || $0.isNumber } ?? false
+        let baseBar = Self.showBar(base: options.showThreshold, midWord: midWord)
+        // A phrase the author has used repeatedly earns a lower bar still (eval:
+        // +13% accepted characters on a repeat-writer set).
+        let hintScale = hintSupport >= 2 ? AppSettings.shared.personalization.repeatedPhraseBar : 1
+        // The decoder skips the phrase search for a first word below the bar:
+        // nothing would be shown, so most of the request's model passes are saved.
+        options.minimumConfidenceToExtend = baseBar
+        options.hintFollowerConfidenceScale = hintScale
+        let cacheKey = "\(models.loadedID ?? "")|\(options.maxWords)|\(options.showThreshold)|\(hintScale)|\(String(decoding: options.hint, as: UTF8.self))|\(text)"
         let start = Date()
         let result: TabTypeKit.CompletionResult
         let cached: Bool
@@ -56,7 +84,19 @@ final class LlamaEngine {
             cached = true
         } else {
             let id = models.inference.beginRequest()
-            guard let fresh = try? await models.inference.complete(text, options: options, requestID: id) else {
+            if let onFirstWord { firstWordHandlers[id] = onFirstWord }
+            defer { firstWordHandlers[id] = nil }
+            var notify: (@Sendable (TabTypeKit.CompletionResult) -> Void)?
+            if onFirstWord != nil {
+                notify = { [weak self] partial in
+                    guard partial.confidence >= baseBar * (partial.followsHint ? hintScale : 1) else { return }
+                    let word = partial.text
+                    Task { @MainActor in self?.firstWordHandlers[id]?(word) }
+                }
+            }
+            let fresh = try? await models.inference.complete(text, options: options, requestID: id,
+                                                             onFirstWord: notify)
+            guard let fresh else {
                 return nil   // superseded by a newer keystroke, or not loaded
             }
             result = fresh
@@ -65,17 +105,7 @@ final class LlamaEngine {
         }
         lastResult = result
         let ms = Int(Date().timeIntervalSince(start) * 1000)
-        // Measured on the author's own writing (867 cases from their real typing):
-        // finishing a half-typed word is right far more often than guessing the
-        // next one (53–65% vs 21–32% when shown), so mid-word gets the low bar
-        // (×0.4 → 0.08) and a word boundary the higher one (×0.75 → 0.15). Versus
-        // 0.10 / 0.15: same characters saved, fewer wrong ghosts on both their
-        // writing (42.0 → 37.4%) and seed-v1 (30.7 → 28.6%).
-        let midWord = request.beforeCursor.last.map { $0.isLetter || $0.isNumber } ?? false
-        var threshold = options.showThreshold * (midWord ? 0.4 : 0.75)
-        // A phrase the author has used repeatedly earns a lower bar still (eval:
-        // +13% accepted characters on a repeat-writer set).
-        if result.followsHint && hintSupport >= 2 { threshold *= AppSettings.shared.personalization.repeatedPhraseBar }
+        let threshold = baseBar * (result.followsHint ? hintScale : 1)
         // Lookahead (speculative) results stay out of the statistics.
         let quiet = request.speculative
         guard result.confidence >= threshold else {

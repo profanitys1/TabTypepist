@@ -42,6 +42,31 @@ final class LlamaIntegrationTests: XCTestCase {
         }
     }
 
+    /// An unchanged prompt (typing inside a word) is answered from the saved
+    /// logits: no model pass, same numbers.
+    func testUnchangedPromptIsAnsweredWithoutAModelPass() throws {
+        try eachModel { runtime in
+            let tokens = runtime.tokenize("Thanks for sending the report over, I will", addSpecial: true)
+            runtime.reset()
+            let first = Array(try runtime.evaluatePrompt(tokens).values)
+            // A decode in between must not disturb the saved prompt logits.
+            runtime.fork(to: 1)
+            _ = try runtime.decode([BatchEntry(token: tokens[tokens.count - 1], position: tokens.count, sequence: 1)])
+            let passes = runtime.decodeCalls
+            let again = Array(try runtime.evaluatePrompt(tokens).values)
+            XCTAssertEqual(runtime.decodeCalls, passes, runtime.modelDescription)
+            XCTAssertEqual(runtime.lastPrefillCount, 0)
+            XCTAssertEqual(first, again, runtime.modelDescription)
+
+            runtime.reusesPromptLogits = false
+            defer { runtime.reusesPromptLogits = true }
+            let recomputed = Array(try runtime.evaluatePrompt(tokens).values)
+            XCTAssertGreaterThan(runtime.decodeCalls, passes)
+            XCTAssertEqual(argmax(first), argmax(recomputed), runtime.modelDescription)
+            XCTAssertLessThan(maxTopDifference(first, recomputed), 0.1, runtime.modelDescription)
+        }
+    }
+
     /// Logits after reusing a cached prefix must match logits computed from scratch.
     func testPrefixReuseMatchesFreshEvaluation() throws {
         try eachModel { runtime in
