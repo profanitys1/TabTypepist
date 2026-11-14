@@ -102,6 +102,39 @@ final class TrimmerAndTypoTests: XCTestCase {
         XCTAssertNil(makeSym().topCompletion(prefix: "un"))
     }
 
+    // MARK: - SymSpell prefix lookup
+
+    func testPrefixLookupMatchesAScanOfTheDictionary() {
+        let words = ["the", "them", "theme", "then", "thé", "théâtre", "test", "testing", "zebra",
+                     "a", "an", "and", "café", "cafe\u{301}s", "naïve", "über", "日本", "日本語"]
+        let sym = SymSpell()
+        sym.load(contents: words.map { "\($0) 5000" }.joined(separator: "\n"))
+        let probes = ["t", "th", "the", "thé", "thé", "them", "themes", "tes", "testing", "testings", "z", "zz",
+                      "caf", "cafe", "café", "cafe\u{301}", "na", "nai", "naï", "ü", "u", "日", "日本", "日本語s",
+                      "THE", "Théâ", "x", "b"]
+        for probe in probes {
+            let c = probe.lowercased()
+            XCTAssertEqual(sym.isKnownOrPrefix(probe), words.contains { $0.hasPrefix(c) }, probe)
+        }
+    }
+
+    func testTopCompletionPrefersFrequencyAcrossTheWholeRun() {
+        let sym = SymSpell()
+        sym.load(contents: "confer 2000\nconference 900000\nconfess 3000\nconfetti 1500\ncone 800000")
+        XCTAssertEqual(sym.topCompletion(prefix: "conf"), "conference")
+        XCTAssertEqual(sym.topCompletion(prefix: "CONFE"), "conference")
+    }
+
+    // MARK: - Typing ahead of an in-flight request
+
+    func testTypedAheadAgreesOnlyAlongTheFirstWord() {
+        XCTAssertTrue(Engine.typedAhead("", agreesWith: "there"))
+        XCTAssertTrue(Engine.typedAhead("th", agreesWith: "there"))
+        XCTAssertTrue(Engine.typedAhead("there ", agreesWith: "there"))
+        XCTAssertFalse(Engine.typedAhead("ta", agreesWith: "there"))
+        XCTAssertTrue(Engine.typedAhead("ta", agreesWith: nil))   // first word not known yet
+    }
+
     // MARK: - shouldPredict email gate
 
     func testEmailInProgressBlocksPrediction() {

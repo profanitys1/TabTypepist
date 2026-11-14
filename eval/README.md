@@ -24,6 +24,23 @@ eval/results/  run outputs (per-case suggestions + summary)
 .build/release/tabtype-eval report <run.json> --baseline <other.json>
 ```
 
+### Typing latency
+
+`run` scores one request per case. `bench` replays typing instead: the field grows
+one character at a time and every keystroke asks for a suggestion, with the app's
+show bars. It reports model passes per keystroke, the time until the first word
+could be on screen, and the time until the whole phrase.
+
+```bash
+.build/release/tabtype-eval bench --model <file.gguf> --cases eval/cases/seed-v1.jsonl --header
+.build/release/tabtype-eval bench --model <file.gguf> --cases eval/cases/seed-v1.jsonl --header --baseline
+```
+
+`--baseline` turns off the speed-ups measured here (saved prompt logits for an
+unchanged prompt, skipping the phrase search under the show bar, the early first
+word, multi-core logit analysis) so one binary gives both sides of the comparison.
+`run --no-gate` does the same for the phrase-search skip alone.
+
 Keep `seed-v1.jsonl` frozen so numbers stay comparable; add new case sets under a new
 name instead of regenerating it. Add your own writing as extra corpus files (keep
 private text out of git).

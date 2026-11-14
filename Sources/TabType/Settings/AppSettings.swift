@@ -76,6 +76,12 @@ final class AppSettings: ObservableObject {
     @Published var useClipboardContext: Bool { didSet { defaults.set(useClipboardContext, forKey: Keys.useClipboardContext) } }
     /// Sample the caret area to match ghost-text colour to the field (screenshot-assisted).
     @Published var useScreenshotAppearance: Bool { didSet { defaults.set(useScreenshotAppearance, forKey: Keys.useScreenshotAppearance) } }
+    /// Show a suggestion's first word as soon as the model has settled it and
+    /// add the rest of the phrase when its search finishes. No UI: a kill switch
+    /// (`defaults write app.tabtype.TabType showFirstWordEarly -bool NO`).
+    var showFirstWordEarly: Bool {
+        defaults.object(forKey: "showFirstWordEarly") as? Bool ?? true
+    }
     /// One-time hint flags.
     var didShowGoogleDocsHint: Bool {
         get { defaults.bool(forKey: Keys.didShowGoogleDocsHint) }

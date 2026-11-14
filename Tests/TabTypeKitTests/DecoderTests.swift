@@ -132,6 +132,64 @@ final class CompletionDecoderTests: XCTestCase {
         XCTAssertEqual(m.liveCandidateSequences, [])
     }
 
+    // MARK: Show-bar gate and early first word
+
+    private let phraseRules: [String: [String: Float]] = [
+        "on": [" the": 5], "the": [" cat": 3, " dog": 2],
+        "cat": [" sat": 4, ".": 1], "sat": [" on": 5],
+    ]
+
+    func testFirstWordBelowTheShowBarSkipsThePhraseSearch() throws {
+        var options = DecoderOptions()
+        options.extensionThreshold = 0.3
+        let searched = model(phraseRules)
+        let full = try XCTUnwrap(CompletionDecoder.complete("on the ", model: searched, options: options))
+        XCTAssertEqual(full.text, "cat sat on the")
+
+        // "cat" is ~0.73 likely: a caller that needs 0.9 to show it never
+        // displays the phrase, so no passes are spent finding it.
+        options.minimumConfidenceToExtend = 0.9
+        let gated = model(phraseRules)
+        let short = try XCTUnwrap(CompletionDecoder.complete("on the ", model: gated, options: options))
+        XCTAssertEqual(short.text, "cat")
+        XCTAssertEqual(short.confidence, full.words[0].probability, accuracy: 1e-6)
+        XCTAssertLessThan(gated.decodeCalls, searched.decodeCalls)
+        XCTAssertEqual(gated.liveCandidateSequences, [])
+
+        // The hint scale lowers the bar only for a first word that follows the hint.
+        options.hint = Array("cat".utf8)
+        options.hintFollowerConfidenceScale = 0.5
+        let hinted = try XCTUnwrap(CompletionDecoder.complete("on the ", model: model(phraseRules), options: options))
+        XCTAssertTrue(hinted.text.hasPrefix("cat sat"), hinted.text)
+    }
+
+    func testFirstWordIsReportedBeforeThePhrase() throws {
+        var options = DecoderOptions()
+        options.extensionThreshold = 0.3
+        var early: [CompletionResult] = []
+        let r = try XCTUnwrap(CompletionDecoder.complete("on the ", model: model(phraseRules), options: options,
+                                                         onFirstWord: { early.append($0) }))
+        XCTAssertEqual(early.count, 1)
+        XCTAssertEqual(early.first?.text, "cat")
+        XCTAssertTrue(r.text.hasPrefix(early.first?.text ?? "?"))
+        XCTAssertEqual(early.first?.confidence ?? 0, r.words[0].probability, accuracy: 1e-6)
+    }
+
+    func testFirstWordIsNotReportedWithoutAPhraseSearch() throws {
+        var early = 0
+        var options = DecoderOptions()
+        options.extensionThreshold = 2   // single words: nothing to wait for
+        _ = try CompletionDecoder.complete("on the ", model: model(phraseRules), options: options,
+                                           onFirstWord: { _ in early += 1 })
+        XCTAssertEqual(early, 0)
+
+        options.extensionThreshold = 0.3
+        options.minimumConfidenceToExtend = 0.9   // below the show bar
+        _ = try CompletionDecoder.complete("on the ", model: model(phraseRules), options: options,
+                                           onFirstWord: { _ in early += 1 })
+        XCTAssertEqual(early, 0)
+    }
+
     func testNothingLikelyMeansNoSuggestion() throws {
         // Only end-of-text is plausible after the prompt.
         let m = model([:])
@@ -222,5 +280,71 @@ final class BeamSearchTests: XCTestCase {
         XCTAssertEqual(r.confidence, 0.45, accuracy: 0.03)
         XCTAssertEqual(r.alternatives.first?.text, " take")
         XCTAssertTrue(m.liveCandidateSequences.isEmpty, "beam sequences must be released")
+    }
+}
+
+final class LogitMathTests: XCTestCase {
+    private func randomLogits(_ n: Int, seed: UInt64) -> [Float] {
+        var state = seed
+        return (0..<n).map { _ in
+            state = state &* 6364136223846793005 &+ 1442695040888963407
+            // Coarse values so ties occur.
+            return Float(Int(state >> 40) % 400) / 10 - 20
+        }
+    }
+
+    private func referenceTopK(_ v: [Float], k: Int, blocked: [Bool]) -> [TokenID] {
+        v.indices.filter { !blocked[$0] }
+            .sorted { v[$0] != v[$1] ? v[$0] > v[$1] : $0 < $1 }
+            .prefix(k).map { TokenID($0) }
+    }
+
+    func testTopKMatchesASortedReference() {
+        let n = 5000
+        let blocked = (0..<n).map { $0 % 7 == 0 }
+        for seed in 1...4 {
+            let v = randomLogits(n, seed: UInt64(seed))
+            v.withUnsafeBufferPointer { buffer in
+                let logits = Logits(buffer)
+                for k in [1, 3, 9] {
+                    XCTAssertEqual(LogitMath.topK(logits, k: k, candidates: nil, blocked: blocked),
+                                   referenceTopK(v, k: k, blocked: blocked))
+                }
+                let some = stride(from: 1, to: n, by: 3).map { TokenID($0) }
+                let expected = some.sorted { v[Int($0)] != v[Int($1)] ? v[Int($0)] > v[Int($1)] : $0 < $1 }.prefix(5)
+                XCTAssertEqual(LogitMath.topK(logits, k: 5, candidates: some, blocked: blocked), Array(expected))
+            }
+        }
+    }
+
+    /// The batched (and, for large batches, multi-core) analysis must read the
+    /// same numbers the per-entry helpers do.
+    func testBatchedAnalysisMatchesPerEntryHelpers() {
+        let n = 20_000   // above the parallel floor
+        let blocked = (0..<n).map { $0 % 11 == 0 }
+        let rows = (1...6).map { randomLogits(n, seed: UInt64($0 * 97)) }
+        let buffers = rows.map { row -> UnsafeMutableBufferPointer<Float> in
+            let b = UnsafeMutableBufferPointer<Float>.allocate(capacity: n)
+            _ = b.initialize(from: row)
+            return b
+        }
+        defer { buffers.forEach { $0.deallocate() } }
+        let batch = buffers.map { Logits(UnsafeBufferPointer($0)) }
+
+        let saved = LogitMath.parallelBatchThreshold
+        defer { LogitMath.parallelBatchThreshold = saved }
+        var scratch: [Float] = []
+        for threshold in [1, Int.max] {   // multi-core, then serial
+            LogitMath.parallelBatchThreshold = threshold
+            let analyses = LogitMath.analyze(batch, k: 9, blocked: blocked)
+            XCTAssertEqual(analyses.count, rows.count)
+            for (i, a) in analyses.enumerated() {
+                XCTAssertEqual(a.maxValue, rows[i].max())
+                XCTAssertEqual(rows[i][a.argmax], a.maxValue)
+                XCTAssertEqual(a.logNormalizer, LogitMath.logSumExp(batch[i], blocked: nil, scratch: &scratch),
+                               accuracy: 1e-4)
+                XCTAssertEqual(a.top, referenceTopK(rows[i], k: 9, blocked: blocked))
+            }
+        }
     }
 }

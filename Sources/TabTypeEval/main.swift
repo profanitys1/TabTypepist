@@ -4,6 +4,10 @@
 //   tabtype-eval smoke --model <file.gguf> [--text "…"]
 //   tabtype-eval run --model <file.gguf> --cases <cases.jsonl> [--backend decoder|greedy]
 //                    [--threshold P] [--max-words N] [--extend P] [--out run.json] [--baseline run.json] [--limit N]
+//                    [--no-gate]  (always search the whole phrase, even when the first word is below --threshold)
+//   tabtype-eval bench --model <file.gguf> --cases <cases.jsonl> [--limit N] [--chars N] [--template base] [--header]
+//                    [--threshold P] [--max-words N] [--baseline]   (typing replay: latency per keystroke;
+//                    --baseline turns this build's speed-ups off for an A/B on one binary)
 //   tabtype-eval report <run.json> [--baseline run.json]
 //                    [--template legacy|base|chatml|chatml-nothink|gemma|llama3|phi] [--author "Name"]
 //   tabtype-eval sweep <run.json>            (confidence-threshold tradeoff of a decoder run)
@@ -114,7 +118,8 @@ case "run":
                                  sections: arguments.contains("--sections"),
                                  conversations: !arguments.contains("--plain-chat"),
                                  history: try option("--history").map { try JSONL.read(CorpusEntry.self, from: url($0)) },
-                                 hintFactor: option("--hint-factor").flatMap(Double.init) ?? 0.5)
+                                 hintFactor: option("--hint-factor").flatMap(Double.init) ?? 0.5,
+                                 gatesExtension: !arguments.contains("--no-gate"))
     case let other:
         fail("unknown backend \(other)")
     }
@@ -129,6 +134,81 @@ case "run":
         print("personal history: hints offered \(decoder.hintsOffered), followed \(decoder.hintsUsed)")
     }
     print("results → \(out.path)")
+
+case "bench":
+    // Replays typing: each case's field text grows one character at a time and
+    // every keystroke asks for a suggestion, with the app's show bars (mid-word
+    // ×0.4, word boundary ×0.75). Reports what a person waits for: the time until
+    // the first word could be on screen, and the time until the whole phrase.
+    guard let modelPath = option("--model"), let casesPath = option("--cases") else {
+        fail("bench needs --model <file.gguf> --cases <cases.jsonl>")
+    }
+    let baselineMode = arguments.contains("--baseline")
+    var benchCases = try JSONL.read(EvalCase.self, from: url(casesPath))
+    // One case per corpus entry: the others replay the same text.
+    var seenEntries = Set<Substring>()
+    benchCases = benchCases.filter { seenEntries.insert($0.id.split(separator: "-").first ?? "").inserted }
+    benchCases = Array(benchCases.prefix(option("--limit").flatMap(Int.init) ?? 16))
+    let typedChars = option("--chars").flatMap(Int.init) ?? 32
+    let runtime = try LlamaRuntime(modelPath: modelPath)
+    runtime.reusesPromptLogits = !baselineMode
+    if baselineMode { LogitMath.parallelBatchThreshold = .max }
+    let templateName = option("--template") ?? "base"
+    guard let template = ModelTemplate.named(templateName) else { fail("unknown template \(templateName)") }
+    let assembler = PromptAssembler(template: template, situationHeader: arguments.contains("--header"))
+    var baseOptions = DecoderOptions()
+    if let n = option("--max-words").flatMap(Int.init) { baseOptions.maxWords = n }
+    let showThreshold = option("--threshold").flatMap(Double.init) ?? baseOptions.showThreshold
+
+    struct Keystroke { var midWord: Bool; var shown: Bool; var totalMs: Double; var firstMs: Double; var passes: Int }
+    var strokes: [Keystroke] = []
+    func now() -> Double { Double(DispatchTime.now().uptimeNanoseconds) / 1_000_000 }
+    for (n, c) in benchCases.enumerated() {
+        runtime.reset()
+        let full = c.prefix + c.truth
+        let startOffset = max(1, c.prefix.count - typedChars / 2)
+        for length in startOffset...min(full.count, startOffset + typedChars) {
+            var typed = c
+            typed.prefix = String(full.prefix(length))
+            let text = assembler.assemble(typed.promptContext(authorName: option("--author") ?? "Nilava Chowdhury"))
+            let midWord = typed.prefix.last.map { $0.isLetter || $0.isNumber } ?? false
+            let bar = showThreshold * (midWord ? 0.4 : 0.75)
+            var options = baseOptions
+            if !baselineMode { options.minimumConfidenceToExtend = bar }
+            let passesBefore = runtime.decodeCalls
+            let start = now()
+            var firstAt: Double?
+            let result = try CompletionDecoder.complete(text, model: runtime, options: options,
+                                                        onFirstWord: baselineMode ? nil : { _ in firstAt = now() })
+            let end = now()
+            let shown = (result?.confidence ?? 0) >= bar
+            strokes.append(Keystroke(midWord: midWord, shown: shown, totalMs: end - start,
+                                     firstMs: (firstAt ?? end) - start, passes: runtime.decodeCalls - passesBefore))
+        }
+        print("  \(n + 1)/\(benchCases.count)")
+    }
+    func percentile(_ values: [Double], _ p: Double) -> Double {
+        guard !values.isEmpty else { return 0 }
+        let sorted = values.sorted()
+        return sorted[min(sorted.count - 1, Int((Double(sorted.count) * p).rounded(.down)))]
+    }
+    func line(_ label: String, _ s: [Keystroke]) {
+        guard !s.isEmpty else { return }
+        let shown = s.filter(\.shown)
+        print(String(format: "%@  n=%d  shown %.0f%%  model passes/keystroke %.2f  whole request p50 %.0f / p90 %.0f ms  mean %.0f ms",
+                     label, s.count, Double(shown.count) / Double(s.count) * 100,
+                     Double(s.map(\.passes).reduce(0, +)) / Double(s.count),
+                     percentile(s.map(\.totalMs), 0.5), percentile(s.map(\.totalMs), 0.9),
+                     s.map(\.totalMs).reduce(0, +) / Double(s.count)))
+        print(String(format: "    when shown: first word on screen p50 %.0f / p90 %.0f ms   whole phrase p50 %.0f / p90 %.0f ms",
+                     percentile(shown.map(\.firstMs), 0.5), percentile(shown.map(\.firstMs), 0.9),
+                     percentile(shown.map(\.totalMs), 0.5), percentile(shown.map(\.totalMs), 0.9)))
+    }
+    print("\(baselineMode ? "baseline (speed-ups off)" : "this build") · \(URL(fileURLWithPath: modelPath).lastPathComponent) · \(benchCases.count) texts · max \(baseOptions.maxWords) words")
+    line("all keystrokes ", strokes)
+    line("mid-word       ", strokes.filter(\.midWord))
+    line("word boundary  ", strokes.filter { !$0.midWord })
+    print(String(format: "total model time %.1f s", strokes.map(\.totalMs).reduce(0, +) / 1000))
 
 case "report":
     guard let path = positional() else { fail("report needs a run .json path") }
